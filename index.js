@@ -1,605 +1,1048 @@
 const {
     default: makeWASocket,
     useMultiFileAuthState,
-    DisconnectReason
-} = require('@whiskeysockets/baileys');
+    DisconnectReason,
+    downloadMediaMessage
+} = require("@whiskeysockets/baileys");
 
-const pino = require('pino');
-const fs = require('fs-extra');
-const path = require('path');
-const yts = require('yt-search');
-const config = require('./config');
+const pino = require("pino");
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
+const yts = require("yt-search");
+const ytdl = require("@distube/ytdl-core");
 
-let logoBuffer = null;
+const config = require("./config");
 
-/* =========================
-   IMAGE HELPER
-========================= */
+const AUTH_DIR = "./auth_info";
+const DB_DIR = "./database";
+const GROUP_DB = path.join(DB_DIR, "groups.json");
 
-async function getMenuImage() {
-    const files = [
-        'sara-logo.png',
-        'sara-logo.jpg',
-        'logo.png',
-        'logo.jpg'
-    ];
+if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+if (!fs.existsSync(GROUP_DB)) fs.writeFileSync(GROUP_DB, "{}");
 
-    for (const file of files) {
-        const filePath = path.join(__dirname, file);
-
-        if (fs.existsSync(filePath)) {
-            try {
-                return fs.readFileSync(filePath);
-            } catch (_) {}
-        }
+function loadGroups() {
+    try {
+        return JSON.parse(fs.readFileSync(GROUP_DB));
+    } catch {
+        return {};
     }
-
-    if (logoBuffer) return logoBuffer;
-
-    if (config.LOGO) {
-        try {
-            const res = await fetch(config.LOGO);
-
-            if (res.ok) {
-                const buffer = Buffer.from(
-                    await res.arrayBuffer()
-                );
-
-                logoBuffer = buffer;
-                return buffer;
-            }
-        } catch (_) {}
-    }
-
-    return null;
 }
 
-/* =========================
-   HELPERS & DOWNLOADERS
-========================= */
-
-function formatUptime(seconds) {
-    const days = Math.floor(seconds / 86400);
-    seconds %= 86400;
-
-    const hours = Math.floor(seconds / 3600);
-    seconds %= 3600;
-
-    const minutes = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-
-    return `${days}d ${hours}h ${minutes}m ${secs}s`;
-}
-
-function getText(message) {
-    return (
-        message?.conversation ||
-        message?.extendedTextMessage?.text ||
-        message?.imageMessage?.caption ||
-        message?.videoMessage?.caption ||
-        ''
+function saveGroups(data) {
+    fs.writeFileSync(
+        GROUP_DB,
+        JSON.stringify(data, null, 2)
     );
+}
+
+function getGroupData(jid) {
+    const db = loadGroups();
+
+    if (!db[jid]) {
+        db[jid] = {
+            welcome: false,
+            goodbye: false,
+            antilink: false,
+            muted: false
+        };
+        saveGroups(db);
+    }
+
+    return db[jid];
+}
+
+function isGroup(jid) {
+    return jid.endsWith("@g.us");
 }
 
 function getNumber(jid) {
-    return jid
-        ?.split('@')[0]
-        ?.split(':')[0];
+    return jid.split("@")[0];
 }
 
-function isAdmin(participant, metadata) {
-    const user = metadata.participants.find(
-        p => p.id === participant
-    );
+function isOwner(jid) {
+    const number = getNumber(jid);
 
-    return user?.admin === 'admin' ||
-           user?.admin === 'superadmin';
+    return config.OWNER_NUMBER
+        .replace(/[^0-9]/g, "")
+        === number;
 }
 
-const fetchWithTimeout = async (url, options = {}, timeout = 12000) => {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(id);
-        return response;
-    } catch (_) {
-        clearTimeout(id);
-        return null;
-    }
-};
+async function getGroupAdmins(sock, jid) {
+    const metadata = await sock.groupMetadata(jid);
 
-// 🎵 Audio Multi-Route Downloader
-async function getAudioDownloadUrl(videoUrl) {
-    const apiChain = [
-        `https://api.dreaded.site/api/ytdl/audio?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.siputzx.my.id/api/d/ytmp3?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.giftedtech.my.id/api/download/dlmp3?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.davidcyriltech.my.id/download/ytmp3?url=${encodeURIComponent(videoUrl)}`
-    ];
-
-    for (const api of apiChain) {
-        try {
-            const res = await fetchWithTimeout(api);
-            if (res && res.ok) {
-                const data = await res.json();
-                const link = data?.result?.downloadUrl || data?.data?.dl || data?.result?.download_url || data?.result?.url || data?.download;
-                if (link && typeof link === 'string' && link.startsWith('http')) {
-                    return link;
-                }
-            }
-        } catch (_) {
-            continue;
-        }
-    }
-    return null;
+    return metadata.participants
+        .filter(p => p.admin)
+        .map(p => p.id);
 }
 
-// 🎬 Video Multi-Route Downloader
-async function getVideoDownloadUrl(videoUrl) {
-    const apiChain = [
-        `https://api.dreaded.site/api/ytdl/video?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.siputzx.my.id/api/d/ytmp4?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.giftedtech.my.id/api/download/dlmp4?url=${encodeURIComponent(videoUrl)}`,
-        `https://api.davidcyriltech.my.id/download/ytmp4?url=${encodeURIComponent(videoUrl)}`
-    ];
+async function isAdmin(sock, jid, sender) {
+    if (!isGroup(jid)) return false;
 
-    for (const api of apiChain) {
-        try {
-            const res = await fetchWithTimeout(api);
-            if (res && res.ok) {
-                const data = await res.json();
-                const link = data?.result?.downloadUrl || data?.data?.dl || data?.result?.download_url || data?.result?.url || data?.download;
-                if (link && typeof link === 'string' && link.startsWith('http')) {
-                    return link;
-                }
-            }
-        } catch (_) {
-            continue;
-        }
-    }
-    return null;
+    const admins = await getGroupAdmins(sock, jid);
+
+    return admins.includes(sender);
 }
-
-/* =========================
-   START BOT
-========================= */
 
 async function startBot() {
 
-    const authDir = './auth_info';
-
-    if (!fs.existsSync(`${authDir}/creds.json`)) {
-        console.error('❌ auth_info/creds.json not found!');
-        process.exit(1);
-    }
-
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { state, saveCreds } =
+        await useMultiFileAuthState(AUTH_DIR);
 
     const sock = makeWASocket({
         auth: state,
-        logger: pino({ level: 'silent' }),
-        browser: ['SARA MD BOT', 'Chrome', '1.0.0']
+        logger: pino({ level: "silent" }),
+        printQRInTerminal: false,
+        browser: ["Sara MD", "Chrome", "1.0.0"]
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-    /* =========================
-       CONNECTION
-    ========================= */
+    /*
+    ==============================
+           PAIRING CODE
+    ==============================
+    */
 
-    sock.ev.on('connection.update', async update => {
+    if (!sock.authState.creds.registered) {
+
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        const number = await new Promise(resolve => {
+            rl.question(
+                "📱 WhatsApp Number: ",
+                answer => {
+                    rl.close();
+                    resolve(
+                        answer.replace(/[^0-9]/g, "")
+                    );
+                }
+            );
+        });
+
+        try {
+
+            const code =
+                await sock.requestPairingCode(number);
+
+            console.log("\n");
+            console.log("━━━━━━━━━━━━━━━━━━━━");
+            console.log("🔐 PAIRING CODE");
+            console.log("👉 " + code);
+            console.log("━━━━━━━━━━━━━━━━━━━━");
+            console.log("WhatsApp > Linked Devices");
+            console.log("Link with phone number instead");
+            console.log("━━━━━━━━━━━━━━━━━━━━\n");
+
+        } catch (e) {
+            console.log("PAIRING ERROR:", e.message);
+        }
+    }
+
+    /*
+    ==============================
+           CONNECTION
+    ==============================
+    */
+
+    sock.ev.on("connection.update", update => {
+
         const { connection, lastDisconnect } = update;
 
-        if (connection === 'open') {
-            console.log('🚀 SARA MD BOT Connected!');
-
-            const myNumber = getNumber(sock.user.id);
-            const jid = `${myNumber}@s.whatsapp.net`;
-
-            const text =
-`*✦ SARA MD BOT IS ONLINE ✦*
-
-🤖 *Bot:* ${config.BOT_NAME}
-👨‍💻 *Developer:* IMALSHA NETHSARA
-📌 *Prefix:* ${config.PREFIX}
-
-Type *${config.PREFIX}menu* to view commands.`;
-
-            try {
-                const img = await getMenuImage();
-                if (img) {
-                    await sock.sendMessage(jid, { image: img, caption: text });
-                } else {
-                    await sock.sendMessage(jid, { text });
-                }
-            } catch (_) {}
+        if (connection === "open") {
+            console.log("╭────────────────────╮");
+            console.log("│   🤖 BOT CONNECTED  │");
+            console.log("╰────────────────────╯");
         }
 
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+        if (connection === "close") {
 
-            if (statusCode !== DisconnectReason.loggedOut) {
-                console.log('🔄 Reconnecting...');
-                setTimeout(startBot, 3000);
+            const status =
+                lastDisconnect?.error?.output?.statusCode;
+
+            if (status !== DisconnectReason.loggedOut) {
+                console.log("🔄 Reconnecting...");
+                startBot();
             } else {
-                console.log('❌ Logged out.');
-                process.exit(1);
+                console.log("❌ Logged out.");
             }
         }
     });
 
-    /* =========================
-       MESSAGE HANDLER
-    ========================= */
+    /*
+    ==============================
+             MESSAGES
+    ==============================
+    */
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0];
+    sock.ev.on("messages.upsert", async ({ messages }) => {
 
-        if (!msg?.message) return;
-        if (msg.key.fromMe) return;
+        try {
 
-        const from = msg.key.remoteJid;
-        if (!from) return;
+            const msg = messages[0];
 
-        const isGroup = from.endsWith('@g.us');
-        const sender = isGroup ? msg.key.participant : from;
-        const senderNumber = getNumber(sender);
-        const ownerNumber = getNumber(config.OWNER_NUMBER);
-        const isOwner = senderNumber === ownerNumber;
+            if (!msg.message) return;
+            if (msg.key.fromMe) return;
 
-        const body = getText(msg).trim();
-        const prefix = config.PREFIX;
+            const jid = msg.key.remoteJid;
+            const sender = msg.key.participant || jid;
 
-        if (!body.startsWith(prefix)) return;
+            const text =
+                msg.message.conversation ||
+                msg.message.extendedTextMessage?.text ||
+                "";
 
-        const parts = body.slice(prefix.length).trim().split(/\s+/);
-        const command = parts.shift()?.toLowerCase();
-        const q = parts.join(' ');
+            if (!text) return;
 
-        const footer = `\n\n👨‍💻 *CREATED BY IMALSHA NETHSARA*`;
+            const prefix = config.PREFIX || ".";
 
-        /* =====================
-           MENU
-        ===================== */
+            if (!text.startsWith(prefix)) return;
 
-        if (command === 'menu' || command === 'help') {
-            const uptime = formatUptime(process.uptime());
-            const ram = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+            const args = text
+                .slice(prefix.length)
+                .trim()
+                .split(/\s+/);
 
-            const menu =
-`╭━━━〔 ✦ *SARA MD BOT* ✦ 〕━━━╮
-┃ 👨‍💻 *Dev:* IMALSHA NETHSARA
-┃ 🤖 *Version:* 2.5.0
-┃ ⏱️ *Uptime:* ${uptime}
-┃ 💾 *RAM:* ${ram} MB
-┃ 📌 *Prefix:* ${prefix}
-╰━━━━━━━━━━━━━━━━━━━━━━━╯
+            const command =
+                args.shift()?.toLowerCase();
 
-╭━━━〔 📥 *DOWNLOAD / SEARCH* 〕━━━╮
-┃ ◈ ${prefix}song <name/url>
-┃ ◈ ${prefix}video <name/url>
-╰━━━━━━━━━━━━━━━━━━━━━━━╯
+            const fullText = args.join(" ");
 
-╭━━━〔 👥 *GROUP COMMANDS* 〕━━━╮
-┃ ◈ ${prefix}tagall
-┃ ◈ ${prefix}hidetag <text>
-┃ ◈ ${prefix}open
-┃ ◈ ${prefix}close
-╰━━━━━━━━━━━━━━━━━━━━━━━╯
+            /*
+            ==============================
+                    MENU
+            ==============================
+            */
 
-╭━━━〔 👑 *OWNER* 〕━━━╮
-┃ ◈ ${prefix}owner
-┃ ◈ ${prefix}restart
-╰━━━━━━━━━━━━━━━━━━━━━━━╯
+            if (command === "menu") {
 
-╭━━━〔 🛠️ *TOOLS* 〕━━━╮
-┃ ◈ ${prefix}ping
-┃ ◈ ${prefix}alive
-╰━━━━━━━━━━━━━━━━━━━━━━━╯${footer}`;
+                const menu = `
+╭━━━〔 👥 GROUP COMMANDS 〕━━━╮
 
-            const img = await getMenuImage();
+│ .tagall
+│ .hidetag
+│ .admins
+│ .groupinfo
+│ .getpp
+│ .promote
+│ .demote
+│ .kick
+│ .add
+│ .setname
+│ .setdesc
+│ .open
+│ .close
+│ .welcome on/off
+│ .goodbye on/off
+│ .antilink on/off
+│ .mute
+│ .unmute
 
-            if (img) {
-                await sock.sendMessage(from, { image: img, caption: menu }, { quoted: msg });
-            } else {
-                await sock.sendMessage(from, { text: menu }, { quoted: msg });
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+
+╭━━━〔 👑 OWNER COMMANDS 〕━━━╮
+
+│ .owner
+│ .restart
+│ .shutdown
+│ .update
+│ .setprefix
+│ .mode public
+│ .mode private
+│ .block
+│ .unblock
+│ .ban
+│ .unban
+│ .broadcast
+│ .join
+│ .leave
+│ .setbio
+│ .setname
+│ .setpp
+│ .eval
+
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+
+╭━━━〔 📥 DOWNLOAD COMMANDS 〕━━━╮
+
+│ .song <title>
+│ .play <title>
+│ .audio <title>
+│ .video <title>
+
+╰━━━━━━━━━━━━━━━━━━━━━━╯
+
+        🤖 ${config.BOT_NAME}
+`;
+
+                await sock.sendMessage(jid, {
+                    text: menu
+                });
+
+                return;
             }
-            return;
-        }
 
-        /* =====================
-           ALIVE
-        ===================== */
+            /*
+            ==============================
+                 OWNER COMMANDS
+            ==============================
+            */
 
-        if (command === 'alive') {
-            const uptime = formatUptime(process.uptime());
-            await sock.sendMessage(
-                from,
-                {
+            const ownerCommands = [
+                "owner",
+                "restart",
+                "shutdown",
+                "update",
+                "setprefix",
+                "mode",
+                "block",
+                "unblock",
+                "ban",
+                "unban",
+                "broadcast",
+                "join",
+                "leave",
+                "setbio",
+                "setname",
+                "setpp",
+                "eval"
+            ];
+
+            if (ownerCommands.includes(command)) {
+
+                if (!isOwner(sender)) {
+
+                    await sock.sendMessage(jid, {
+                        text: "❌ Owner only command."
+                    });
+
+                    return;
+                }
+            }
+
+            if (command === "owner") {
+
+                await sock.sendMessage(jid, {
                     text:
-`✨ *SARA MD BOT IS ONLINE*
+                        `👑 *BOT OWNER*\n\n` +
+                        `📞 +${config.OWNER_NUMBER}\n` +
+                        `🤖 ${config.BOT_NAME}`
+                });
 
-🤖 Status: Active
-⏱️ Uptime: ${uptime}${footer}`
-                },
-                { quoted: msg }
-            );
-            return;
-        }
-
-        /* =====================
-           PING
-        ===================== */
-
-        if (command === 'ping') {
-            const start = Date.now();
-            await sock.sendMessage(from, { text: '🏓 *Pinging...*' }, { quoted: msg });
-            const latency = Date.now() - start;
-
-            await sock.sendMessage(
-                from,
-                {
-                    text:
-`🏓 *PONG!*
-
-⚡ Response: ${latency} ms${footer}`
-                },
-                { quoted: msg }
-            );
-            return;
-        }
-
-        /* =====================
-           OWNER
-        ===================== */
-
-        if (command === 'owner') {
-            await sock.sendMessage(
-                from,
-                {
-                    text:
-`╭━━〔 👑 *BOT OWNER* 〕━━╮
-┃
-┃ 👨‍💻 Name:
-┃ IMALSHA NETHSARA
-┃
-┃ 📞 Number:
-┃ +${config.OWNER_NUMBER}
-┃
-┃ 🛠️ Role:
-┃ Creator & Developer
-┃
-╰━━━━━━━━━━━━━━━━━━╯${footer}`
-                },
-                { quoted: msg }
-            );
-            return;
-        }
-
-        /* =====================
-           OWNER RESTART
-        ===================== */
-
-        if (command === 'restart') {
-            if (!isOwner) {
-                await sock.sendMessage(from, { text: `❌ Owner only command.${footer}` }, { quoted: msg });
                 return;
             }
 
-            await sock.sendMessage(from, { text: `🔄 *SARA MD BOT restarting...*` }, { quoted: msg });
-            setTimeout(() => process.exit(0), 1000);
-            return;
-        }
+            if (command === "restart") {
 
-        /* =====================
-           GROUP CHECK & METADATA
-        ===================== */
+                await sock.sendMessage(jid, {
+                    text: "🔄 Restarting bot..."
+                });
 
-        const groupCommands = ['tagall', 'hidetag', 'open', 'close'];
+                setTimeout(() => {
+                    process.exit(0);
+                }, 1500);
 
-        if (groupCommands.includes(command) && !isGroup) {
-            await sock.sendMessage(from, { text: `❌ මේ command එක Group එකකදී විතරයි වැඩ කරන්නේ.${footer}` }, { quoted: msg });
-            return;
-        }
-
-        let metadata = null;
-        if (isGroup && groupCommands.includes(command)) {
-            metadata = await sock.groupMetadata(from);
-        }
-
-        /* =====================
-           TAG ALL & HIDETAG
-        ===================== */
-
-        if (command === 'tagall') {
-            const mentions = metadata.participants.map(p => p.id);
-            let text = q || '📢 *Attention Everyone!*';
-            text += '\n\n';
-
-            for (const participant of metadata.participants) {
-                text += `@${getNumber(participant.id)} `;
-            }
-
-            await sock.sendMessage(from, { text, mentions }, { quoted: msg });
-            return;
-        }
-
-        if (command === 'hidetag') {
-            if (!q) {
-                await sock.sendMessage(from, { text: `❌ Text එකක් දෙන්න.\n\nExample: ${prefix}hidetag Hello` }, { quoted: msg });
-                return;
-            }
-            const mentions = metadata.participants.map(p => p.id);
-            await sock.sendMessage(from, { text: q, mentions }, { quoted: msg });
-            return;
-        }
-
-        /* =====================
-           OPEN / CLOSE GROUP
-        ===================== */
-
-        if (command === 'open') {
-            if (!isOwner && !isAdmin(sender, metadata)) {
-                await sock.sendMessage(from, { text: `❌ Admin only command.` }, { quoted: msg });
-                return;
-            }
-            try {
-                await sock.groupSettingUpdate(from, 'not_announcement');
-                await sock.sendMessage(from, { text: `🔓 *Group opened!*\n\nMembers can now send messages.` }, { quoted: msg });
-            } catch (_) {
-                await sock.sendMessage(from, { text: `❌ Group open කරන්න බැරි වුණා.` }, { quoted: msg });
-            }
-            return;
-        }
-
-        if (command === 'close') {
-            if (!isOwner && !isAdmin(sender, metadata)) {
-                await sock.sendMessage(from, { text: `❌ Admin only command.` }, { quoted: msg });
-                return;
-            }
-            try {
-                await sock.groupSettingUpdate(from, 'announcement');
-                await sock.sendMessage(from, { text: `🔒 *Group closed!*\n\nOnly admins can send messages.` }, { quoted: msg });
-            } catch (_) {
-                await sock.sendMessage(from, { text: `❌ Group close කරන්න බැරි වුණා.` }, { quoted: msg });
-            }
-            return;
-        }
-
-        /* =====================
-           SONG DOWNLOADER (AUDIO)
-        ===================== */
-
-        if (command === 'song' || command === 'play') {
-            if (!q) {
-                await sock.sendMessage(from, { text: `❌ Song name එකක් හෝ Link එකක් දෙන්න.\n\nExample: ${prefix}song Lelena` }, { quoted: msg });
                 return;
             }
 
-            await sock.sendMessage(from, { text: `⚡ *SARA MD BOT* - ගීතය සෙවීම ආරම්භ කළා... ⏳` }, { quoted: msg });
+            if (command === "shutdown") {
 
-            try {
-                let videoUrl = q;
-                let title = 'Song';
-                let thumbUrl = null;
+                await sock.sendMessage(jid, {
+                    text: "🛑 Shutting down..."
+                });
 
-                if (!q.includes('youtube.com') && !q.includes('youtu.be')) {
-                    const search = await yts(q);
-                    const video = search.videos[0];
-                    if (!video) {
-                        await sock.sendMessage(from, { text: `❌ Song එක හොයාගන්න බැරි වුණා.` }, { quoted: msg });
-                        return;
-                    }
-                    videoUrl = video.url;
-                    title = video.title;
-                    thumbUrl = video.thumbnail;
+                setTimeout(() => {
+                    process.exit(0);
+                }, 1000);
+
+                return;
+            }
+
+            if (command === "setprefix") {
+
+                if (!args[0]) {
+                    await sock.sendMessage(jid, {
+                        text: "Example: .setprefix !"
+                    });
+                    return;
                 }
 
-                const infoText = `🎧 *SARA MD SONG DOWNLOADER*\n\n📌 *Title:* ${title}\n📤 *Audio එක යවමින් පවතී...*${footer}`;
+                config.PREFIX = args[0];
 
-                if (thumbUrl) {
-                    await sock.sendMessage(from, { image: { url: thumbUrl }, caption: infoText }, { quoted: msg });
-                } else {
-                    await sock.sendMessage(from, { text: infoText }, { quoted: msg });
+                await sock.sendMessage(jid, {
+                    text:
+                        `✅ Prefix changed to: ${config.PREFIX}`
+                });
+
+                return;
+            }
+
+            if (command === "mode") {
+
+                const mode = args[0]?.toLowerCase();
+
+                if (!["public", "private"].includes(mode)) {
+                    await sock.sendMessage(jid, {
+                        text:
+                            "Example:\n.mode public\n.mode private"
+                    });
+                    return;
                 }
 
-                const audioUrl = await getAudioDownloadUrl(videoUrl);
+                config.MODE = mode;
 
-                if (audioUrl) {
-                    await sock.sendMessage(
-                        from,
-                        {
-                            audio: { url: audioUrl },
-                            mimetype: 'audio/mpeg',
-                            fileName: `${title}.mp3`,
-                            ptt: false
-                        },
-                        { quoted: msg }
+                await sock.sendMessage(jid, {
+                    text:
+                        `✅ Bot mode: ${mode}`
+                });
+
+                return;
+            }
+
+            if (command === "block") {
+
+                const target =
+                    msg.message.extendedTextMessage
+                        ?.contextInfo?.mentionedJid?.[0];
+
+                if (!target) {
+                    await sock.sendMessage(jid, {
+                        text:
+                            "❌ Mention a user."
+                    });
+                    return;
+                }
+
+                await sock.updateBlockStatus(
+                    target,
+                    "block"
+                );
+
+                await sock.sendMessage(jid, {
+                    text: "✅ User blocked."
+                });
+
+                return;
+            }
+
+            if (command === "unblock") {
+
+                const target =
+                    msg.message.extendedTextMessage
+                        ?.contextInfo?.mentionedJid?.[0];
+
+                if (!target) {
+                    await sock.sendMessage(jid, {
+                        text:
+                            "❌ Mention a user."
+                    });
+                    return;
+                }
+
+                await sock.updateBlockStatus(
+                    target,
+                    "unblock"
+                );
+
+                await sock.sendMessage(jid, {
+                    text: "✅ User unblocked."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                  GROUP COMMAND CHECK
+            ==============================
+            */
+
+            const groupCommands = [
+                "tagall",
+                "hidetag",
+                "admins",
+                "groupinfo",
+                "getpp",
+                "promote",
+                "demote",
+                "kick",
+                "add",
+                "setname",
+                "setdesc",
+                "open",
+                "close",
+                "welcome",
+                "goodbye",
+                "antilink",
+                "mute",
+                "unmute"
+            ];
+
+            if (groupCommands.includes(command)) {
+
+                if (!isGroup(jid)) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            "❌ This command is only for groups."
+                    });
+
+                    return;
+                }
+
+                const admin =
+                    await isAdmin(
+                        sock,
+                        jid,
+                        sender
                     );
-                } else {
-                    await sock.sendMessage(from, { text: `❌ Audio එක download කරගන්න බැරි වුණා. වෙනත් නමකින් උත්සාහ කරන්න.` }, { quoted: msg });
-                }
 
-            } catch (err) {
-                await sock.sendMessage(from, { text: `❌ Search error: ${err.message}` }, { quoted: msg });
+                if (!admin && !isOwner(sender)) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            "❌ Admin only command."
+                    });
+
+                    return;
+                }
             }
 
-            return;
-        }
+            /*
+            ==============================
+                    TAG ALL
+            ==============================
+            */
 
-        /* =====================
-           VIDEO DOWNLOADER
-        ===================== */
+            if (command === "tagall") {
 
-        if (command === 'video') {
-            if (!q) {
-                await sock.sendMessage(from, { text: `❌ Video name එකක් හෝ Link එකක් දෙන්න.\n\nExample: ${prefix}video Lehari` }, { quoted: msg });
+                const metadata =
+                    await sock.groupMetadata(jid);
+
+                const mentions =
+                    metadata.participants.map(
+                        p => p.id
+                    );
+
+                let text =
+                    "📢 *TAG ALL*\n\n";
+
+                mentions.forEach((user, i) => {
+                    text +=
+                        `${i + 1}. @${getNumber(user)}\n`;
+                });
+
+                await sock.sendMessage(jid, {
+                    text,
+                    mentions
+                });
+
                 return;
             }
 
-            await sock.sendMessage(from, { text: `⚡ *SARA MD BOT* - වීඩියෝව සෙවීම ආරම්භ කළා... ⏳` }, { quoted: msg });
+            /*
+            ==============================
+                    HIDETAG
+            ==============================
+            */
 
-            try {
-                let videoUrl = q;
-                let title = 'Video';
+            if (command === "hidetag") {
 
-                if (!q.includes('youtube.com') && !q.includes('youtu.be')) {
-                    const search = await yts(q);
-                    const video = search.videos[0];
-                    if (!video) {
-                        await sock.sendMessage(from, { text: `❌ Video එක හොයාගන්න බැරි වුණා.` }, { quoted: msg });
-                        return;
-                    }
-                    videoUrl = video.url;
-                    title = video.title;
-                }
+                const metadata =
+                    await sock.groupMetadata(jid);
 
-                const videoDownloadUrl = await getVideoDownloadUrl(videoUrl);
-
-                if (videoDownloadUrl) {
-                    const infoText = `🎬 *SARA MD VIDEO DOWNLOADER*\n\n📌 *Title:* ${title}\n📤 *Video එක යවමින් පවතී...*${footer}`;
-
-                    await sock.sendMessage(
-                        from,
-                        {
-                            video: { url: videoDownloadUrl },
-                            caption: infoText,
-                            mimetype: 'video/mp4'
-                        },
-                        { quoted: msg }
+                const mentions =
+                    metadata.participants.map(
+                        p => p.id
                     );
-                } else {
-                    await sock.sendMessage(from, { text: `❌ Video එක download කරගන්න බැරි වුණා. වෙනත් නමකින් උත්සාහ කරන්න.` }, { quoted: msg });
-                }
 
-            } catch (err) {
-                await sock.sendMessage(from, { text: `❌ Search error: ${err.message}` }, { quoted: msg });
+                await sock.sendMessage(jid, {
+                    text:
+                        fullText || "📢 Attention everyone!",
+                    mentions
+                });
+
+                return;
             }
 
-            return;
+            /*
+            ==============================
+                     ADMINS
+            ==============================
+            */
+
+            if (command === "admins") {
+
+                const metadata =
+                    await sock.groupMetadata(jid);
+
+                const admins =
+                    metadata.participants
+                        .filter(p => p.admin);
+
+                const mentions =
+                    admins.map(p => p.id);
+
+                let text =
+                    "👑 *GROUP ADMINS*\n\n";
+
+                admins.forEach((admin, i) => {
+                    text +=
+                        `${i + 1}. @${getNumber(admin.id)}\n`;
+                });
+
+                await sock.sendMessage(jid, {
+                    text,
+                    mentions
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                  GROUP INFO
+            ==============================
+            */
+
+            if (command === "groupinfo") {
+
+                const metadata =
+                    await sock.groupMetadata(jid);
+
+                await sock.sendMessage(jid, {
+                    text:
+                        `👥 *GROUP INFO*\n\n` +
+                        `📛 Name: ${metadata.subject}\n` +
+                        `👤 Members: ${metadata.participants.length}\n` +
+                        `🆔 ${jid}`
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                 PROMOTE / DEMOTE
+            ==============================
+            */
+
+            if (
+                command === "promote" ||
+                command === "demote"
+            ) {
+
+                const mentioned =
+                    msg.message.extendedTextMessage
+                        ?.contextInfo?.mentionedJid;
+
+                if (!mentioned?.length) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            `❌ Mention a user.\nExample: ${prefix}${command} @user`
+                    });
+
+                    return;
+                }
+
+                await sock.groupParticipantsUpdate(
+                    jid,
+                    mentioned,
+                    command
+                );
+
+                await sock.sendMessage(jid, {
+                    text:
+                        `✅ ${command} completed.`
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                    KICK
+            ==============================
+            */
+
+            if (command === "kick") {
+
+                const mentioned =
+                    msg.message.extendedTextMessage
+                        ?.contextInfo?.mentionedJid;
+
+                if (!mentioned?.length) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            `❌ Mention a user.`
+                    });
+
+                    return;
+                }
+
+                await sock.groupParticipantsUpdate(
+                    jid,
+                    mentioned,
+                    "remove"
+                );
+
+                await sock.sendMessage(jid, {
+                    text: "✅ User removed."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                     ADD
+            ==============================
+            */
+
+            if (command === "add") {
+
+                if (!args[0]) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            `Example: ${prefix}add 947XXXXXXXX`
+                    });
+
+                    return;
+                }
+
+                const number =
+                    args[0].replace(/[^0-9]/g, "");
+
+                await sock.groupParticipantsUpdate(
+                    jid,
+                    [`${number}@s.whatsapp.net`],
+                    "add"
+                );
+
+                await sock.sendMessage(jid, {
+                    text:
+                        "✅ Add request completed."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                 SET GROUP NAME
+            ==============================
+            */
+
+            if (command === "setname") {
+
+                if (!fullText) {
+                    await sock.sendMessage(jid, {
+                        text:
+                            `Example: ${prefix}setname My Group`
+                    });
+                    return;
+                }
+
+                if (isGroup(jid)) {
+
+                    await sock.groupUpdateSubject(
+                        jid,
+                        fullText
+                    );
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            "✅ Group name updated."
+                    });
+                }
+
+                return;
+            }
+
+            /*
+            ==============================
+                 SET GROUP DESCRIPTION
+            ==============================
+            */
+
+            if (command === "setdesc") {
+
+                if (!fullText) {
+                    await sock.sendMessage(jid, {
+                        text:
+                            `Example: ${prefix}setdesc Welcome`
+                    });
+                    return;
+                }
+
+                await sock.groupUpdateDescription(
+                    jid,
+                    fullText
+                );
+
+                await sock.sendMessage(jid, {
+                    text:
+                        "✅ Group description updated."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                    OPEN / CLOSE
+            ==============================
+            */
+
+            if (
+                command === "open" ||
+                command === "close"
+            ) {
+
+                await sock.groupSettingUpdate(
+                    jid,
+                    command === "close"
+                        ? "announcement"
+                        : "not_announcement"
+                );
+
+                await sock.sendMessage(jid, {
+                    text:
+                        command === "close"
+                            ? "🔒 Group closed."
+                            : "🔓 Group opened."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                 WELCOME / GOODBYE
+            ==============================
+            */
+
+            if (
+                command === "welcome" ||
+                command === "goodbye" ||
+                command === "antilink"
+            ) {
+
+                const value =
+                    args[0]?.toLowerCase();
+
+                if (!["on", "off"].includes(value)) {
+
+                    await sock.sendMessage(jid, {
+                        text:
+                            `Example: ${prefix}${command} on`
+                    });
+
+                    return;
+                }
+
+                const db = loadGroups();
+
+                if (!db[jid])
+                    getGroupData(jid);
+
+                db[jid][command] =
+                    value === "on";
+
+                saveGroups(db);
+
+                await sock.sendMessage(jid, {
+                    text:
+                        `✅ ${command}: ${value}`
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                    MUTE / UNMUTE
+            ==============================
+            */
+
+            if (
+                command === "mute" ||
+                command === "unmute"
+            ) {
+
+                await sock.groupSettingUpdate(
+                    jid,
+                    command === "mute"
+                        ? "announcement"
+                        : "not_announcement"
+                );
+
+                await sock.sendMessage(jid, {
+                    text:
+                        command === "mute"
+                            ? "🔇 Group muted."
+                            : "🔊 Group unmuted."
+                });
+
+                return;
+            }
+
+            /*
+            ==============================
+                 DOWNLOAD COMMANDS (YOUTUBE)
+            ==============================
+            */
+
+            if (["song", "play", "audio"].includes(command)) {
+
+                if (!fullText) {
+                    await sock.sendMessage(jid, {
+                        text: `❌ සින්දුවේ නම හෝ Link එක ලබාදෙන්න.\n*Example:* ${prefix}${command} Nanda Malini`
+                    });
+                    return;
+                }
+
+                await sock.sendMessage(jid, {
+                    text: `🔍 *${fullText}* සින්දුව සොයමින් පවතී...`
+                });
+
+                const search = await yts(fullText);
+                const video = search.videos[0];
+
+                if (!video) {
+                    await sock.sendMessage(jid, {
+                        text: "❌ සින්දුව සොයාගැනීමට නොහැකි විය."
+                    });
+                    return;
+                }
+
+                const captionText =
+                    `🎶 *${config.BOT_NAME} MUSIC DOWNLOADER* 🎶\n\n` +
+                    `📌 *නම:* ${video.title}\n` +
+                    `⏱️ *කාලය:* ${video.timestamp}\n` +
+                    `👁️ *Views:* ${video.views}\n` +
+                    `🔗 *Link:* ${video.url}\n\n` +
+                    `⬇️ *Audio එක Download වෙමින් පවතී...*`;
+
+                await sock.sendMessage(jid, {
+                    image: { url: video.thumbnail },
+                    caption: captionText
+                });
+
+                const filePath = `./${Date.now()}.mp3`;
+                const stream = ytdl(video.url, { filter: "audioonly", quality: "highestaudio" });
+                const writeStream = fs.createWriteStream(filePath);
+
+                stream.pipe(writeStream);
+
+                writeStream.on("finish", async () => {
+                    await sock.sendMessage(jid, {
+                        audio: { url: filePath },
+                        mimetype: "audio/mp4",
+                        fileName: `${video.title}.mp3`,
+                        ptt: false
+                    });
+
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                });
+
+                writeStream.on("error", async (err) => {
+                    console.error("Audio Write Error:", err);
+                    await sock.sendMessage(jid, { text: "❌ Download කිරීමේදී දෝෂයක් සිදු විය." });
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                });
+
+                return;
+            }
+
+            if (command === "video") {
+
+                if (!fullText) {
+                    await sock.sendMessage(jid, {
+                        text: `❌ වීඩියෝවේ නම හෝ Link එක ලබාදෙන්න.\n*Example:* ${prefix}video Nanda Malini`
+                    });
+                    return;
+                }
+
+                await sock.sendMessage(jid, {
+                    text: `🔍 *${fullText}* වීඩියෝව සොයමින් පවතී...`
+                });
+
+                const search = await yts(fullText);
+                const video = search.videos[0];
+
+                if (!video) {
+                    await sock.sendMessage(jid, {
+                        text: "❌ වීඩියෝව සොයාගැනීමට නොහැකි විය."
+                    });
+                    return;
+                }
+
+                const captionText =
+                    `🎬 *${config.BOT_NAME} VIDEO DOWNLOADER* 🎬\n\n` +
+                    `📌 *නම:* ${video.title}\n` +
+                    `⏱️ *කාලය:* ${video.timestamp}\n` +
+                    `👁️ *Views:* ${video.views}\n` +
+                    `🔗 *Link:* ${video.url}\n\n` +
+                    `⬇️ *Video එක Download වෙමින් පවතී...*`;
+
+                await sock.sendMessage(jid, {
+                    image: { url: video.thumbnail },
+                    caption: captionText
+                });
+
+                const filePath = `./${Date.now()}.mp4`;
+                const stream = ytdl(video.url, { quality: "18" }); // Format 18 (Medium quality mp4)
+                const writeStream = fs.createWriteStream(filePath);
+
+                stream.pipe(writeStream);
+
+                writeStream.on("finish", async () => {
+                    await sock.sendMessage(jid, {
+                        video: { url: filePath },
+                        caption: `🎬 *${video.title}*\n\n🤖 ${config.BOT_NAME}`,
+                        mimetype: "video/mp4"
+                    });
+
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                });
+
+                writeStream.on("error", async (err) => {
+                    console.error("Video Write Error:", err);
+                    await sock.sendMessage(jid, { text: "❌ Download කිරීමේදී දෝෂයක් සිදු විය." });
+                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                });
+
+                return;
+            }
+
+        } catch (error) {
+
+            console.error(
+                "MESSAGE ERROR:",
+                error
+            );
+
+            try {
+                await sock.sendMessage(
+                    messages?.[0]?.key?.remoteJid,
+                    {
+                        text:
+                            "❌ Command එක execute කිරීමේදී error එකක් ආවා."
+                    }
+                );
+            } catch {}
         }
-
-        /* =====================
-           UNKNOWN COMMAND
-        ===================== */
-
-        await sock.sendMessage(
-            from,
-            {
-                text:
-`❌ *Unknown Command*
-
-"${command}" කියන command එක නැහැ.
-
-📌 ${prefix}menu → Commands බලන්න.`
-            },
-            { quoted: msg }
-        );
     });
 }
 
-startBot().catch(err => {
-    console.error('❌ Bot startup error:', err);
-});
+startBot();
 
