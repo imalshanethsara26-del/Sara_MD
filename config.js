@@ -1,7 +1,6 @@
 module.exports = {
-    BOT_NAME: 'SARA MD BOT',
-    OWNER_NUMBER: '94765494800',
-    PREFIX: '.',
-    LOGO: '' // Online Image URL එකක් තියෙනවා නම් මෙතැනට දාන්න
+    BOT_NAME: "Sara MD",
+    OWNER_NUMBER: "94769761929", // ඔයාගේ WhatsApp අංකය මෙතැනට යොදන්න
+    PREFIX: ".",
+    MODE: "public"
 };
-
